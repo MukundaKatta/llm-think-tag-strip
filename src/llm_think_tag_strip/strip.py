@@ -29,30 +29,48 @@ class StrippedResult:
     had_thinking: bool = False
 
 
-def _build_closed_pattern(tags: tuple[str, ...], markdown_style: bool) -> re.Pattern[str]:
-    """Build one combined regex matching any closed block form in a single pass.
+def _build_opener_pattern(tags: tuple[str, ...], markdown_style: bool) -> re.Pattern[str]:
+    """Build one combined regex matching the *opener* of any closed block form.
 
-    Combining the angle, bracketed-pipe, and (optional) markdown forms into a
-    single alternation means a single :func:`re.sub` excises every block in true
-    left-to-right source order, regardless of which form each block uses. Each
-    alternative names its tag/body groups uniquely (``tag_a``/``body_a`` etc.)
+    Scanning for openers left-to-right (then locating each opener's matching
+    closer separately) excises every block in true source order regardless of
+    which form it uses, while staying linear in the input size. The previous
+    single combined ``<open>.*?</close>`` pattern was quadratic when the input
+    held many openers with no closer (e.g. ``"<think>" * n``): a lazy ``.*?``
+    re-scanned to end-of-string from every opener position. Splitting opener and
+    closer lets us stop the whole pass as soon as one opener has no closer ahead
+    (no later opener can have one either), avoiding that blow-up.
+
+    Each alternative names its tag group uniquely (``tag_a``/``tag_p``/``tag_m``)
     because Python's :mod:`re` forbids duplicate group names in one pattern.
     """
     if not tags:
         raise ValueError("tags must be a non-empty tuple")
     alt = "|".join(re.escape(t) for t in tags)
-    angle = rf"<(?P<tag_a>{alt})\s*>(?P<body_a>.*?)</(?P=tag_a)\s*>"
-    pipe = rf"<\|(?P<tag_p>{alt})\|>(?P<body_p>.*?)</\|(?P=tag_p)\|>"
+    angle = rf"<(?P<tag_a>{alt})\s*>"
+    pipe = rf"<\|(?P<tag_p>{alt})\|>"
     parts = [angle, pipe]
     if markdown_style:
-        md = (
-            rf"#{{1,6}}[ \t]*(?P<tag_m>{alt})[ \t]*\n"
-            rf"(?P<body_m>.*?)"
-            rf"\n#{{1,6}}[ \t]*end[ \t]+(?P=tag_m)[ \t]*(?:\n|$)"
-        )
-        parts.append(md)
+        parts.append(rf"#{{1,6}}[ \t]*(?P<tag_m>{alt})[ \t]*\n")
     combined = "|".join(f"(?:{p})" for p in parts)
-    return re.compile(combined, re.IGNORECASE | re.DOTALL)
+    return re.compile(combined, re.IGNORECASE)
+
+
+def _build_closer(form: str, tag: str) -> re.Pattern[str]:
+    """Build the closer regex for a single opener ``form``/``tag`` pair.
+
+    ``form`` is ``"a"`` (angle), ``"p"`` (bracketed-pipe), or ``"m"`` (markdown).
+    The markdown closer absorbs the newline that precedes ``### end <tag>`` so it
+    is excised with the block, exactly as the old combined pattern did.
+    """
+    esc = re.escape(tag)
+    if form == "a":
+        pattern = rf"</{esc}\s*>"
+    elif form == "p":
+        pattern = rf"</\|{esc}\|>"
+    else:  # markdown
+        pattern = rf"\n#{{1,6}}[ \t]*end[ \t]+{esc}[ \t]*(?:\n|$)"
+    return re.compile(pattern, re.IGNORECASE)
 
 
 def _build_unclosed_angle_pattern(tags: tuple[str, ...]) -> re.Pattern[str]:
@@ -108,7 +126,8 @@ class Stripper:
     __slots__ = (
         "_tags",
         "_markdown_style",
-        "_closed",
+        "_opener",
+        "_closer_cache",
         "_unclosed_angle",
         "_unclosed_pipe",
         "_unclosed_markdown",
@@ -123,11 +142,15 @@ class Stripper:
             raise ValueError("tags must be a non-empty tuple")
         self._tags = tags
         self._markdown_style = markdown_style
-        # One combined pattern so a single pass excises every closed block in
-        # true source order, regardless of which form (angle/pipe/markdown) it
-        # uses. This keeps the documented "thinking blocks in source order"
-        # contract even when forms are interleaved.
-        self._closed = _build_closed_pattern(tags, markdown_style)
+        # One combined opener pattern; for each opener we then locate its own
+        # closer. Scanning left-to-right keeps the documented "thinking blocks in
+        # source order" contract even when the angle/pipe/markdown forms are
+        # interleaved, and stays linear in the input (the old single
+        # open-.*?-close pattern was quadratic on many-openers-no-closer input).
+        self._opener = _build_opener_pattern(tags, markdown_style)
+        # Closers are cheap and per (form, tag); cache the compiled patterns so a
+        # reused Stripper does not recompile them on every strip() call.
+        self._closer_cache: dict[tuple[str, str], re.Pattern[str]] = {}
         self._unclosed_angle = _build_unclosed_angle_pattern(tags)
         self._unclosed_pipe = _build_unclosed_pipe_pattern(tags)
         if markdown_style:
@@ -135,28 +158,48 @@ class Stripper:
         else:
             self._unclosed_markdown = None
 
+    def _closer(self, form: str, tag: str) -> re.Pattern[str]:
+        key = (form, tag)
+        pat = self._closer_cache.get(key)
+        if pat is None:
+            pat = _build_closer(form, tag)
+            self._closer_cache[key] = pat
+        return pat
+
     def strip(self, text: str) -> StrippedResult:
         """Strip thinking blocks from ``text`` and return :class:`StrippedResult`."""
         if not text:
             return StrippedResult(clean="", thinking=[], had_thinking=False)
 
         thinking: list[str] = []
-        out = text
 
-        # Closed blocks are excised in a single pass over a combined pattern so
-        # captures land in true left-to-right source order even when the angle,
-        # pipe, and markdown forms are interleaved. Only one body group matches
-        # per alternative, so we pull whichever of the body groups is set.
-        def _capture(m: re.Match[str]) -> str:
-            body = m.group("body_a")
-            if body is None:
-                body = m.group("body_p")
-            if body is None:
-                body = m.groupdict().get("body_m")
-            thinking.append((body or "").strip())
-            return ""
+        # Closed blocks: scan openers left-to-right and excise each block up to
+        # its matching closer. Captures land in true source order even when forms
+        # are interleaved. As soon as an opener has no closer ahead of it we
+        # stop: no later opener can have one either, and the remaining text is
+        # handed to the unclosed-block phase below.
+        kept: list[str] = []
+        pos = 0
+        while True:
+            m = self._opener.search(text, pos)
+            if m is None:
+                kept.append(text[pos:])
+                break
+            if m.group("tag_a") is not None:
+                form, tag = "a", m.group("tag_a")
+            elif m.group("tag_p") is not None:
+                form, tag = "p", m.group("tag_p")
+            else:
+                form, tag = "m", m.group("tag_m")
+            close = self._closer(form, tag).search(text, m.end())
+            if close is None:
+                kept.append(text[pos:])
+                break
+            kept.append(text[pos : m.start()])
+            thinking.append(text[m.end() : close.start()].strip())
+            pos = close.end()
 
-        out = self._closed.sub(_capture, out)
+        out = "".join(kept)
 
         # Unclosed blocks: only match if an open tag exists with no closer left.
         # Try angle, pipe, markdown in that order. Only one unclosed block can

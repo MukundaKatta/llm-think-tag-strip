@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from llm_think_tag_strip import (
@@ -283,3 +285,47 @@ def test_stripper_rejects_empty_tags():
 
 def test_default_tags_constant_exported():
     assert DEFAULT_TAGS == ("thinking", "think")
+
+
+# ---------- performance: no quadratic blow-up on adversarial input ----------
+
+
+def test_many_unclosed_openers_is_linear():
+    # Many openers with no closer used to make the closed-block regex re-scan to
+    # end-of-string from every opener position (O(n**2)). Stripping 50k openers
+    # must now finish near-instantly. A generous wall-clock bound catches a
+    # regression to quadratic without being flaky on slow CI.
+    n = 50_000
+    raw = "<think>" * n + "visible answer"
+    start = time.perf_counter()
+    r = strip_thinking(raw)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"strip_thinking went quadratic: {elapsed:.2f}s for {n} openers"
+    # The first opener has no closer, so everything from it on is treated as one
+    # unclosed thinking block and the visible prefix (empty here) is the clean.
+    assert r.had_thinking is True
+    assert "visible answer" not in r.clean
+
+
+def test_many_closed_blocks_is_linear():
+    n = 50_000
+    raw = "<think>x</think>" * n
+    start = time.perf_counter()
+    r = strip_thinking(raw)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"strip_thinking went quadratic: {elapsed:.2f}s for {n} blocks"
+    assert len(r.thinking) == n
+    assert r.clean == ""
+
+
+# ---------- Stripper with markdown_style reused across calls ----------
+
+
+def test_stripper_markdown_style_reusable():
+    s = Stripper(tags=("think",), markdown_style=True)
+    r1 = s.strip("Top.\n### think\nreason one\n### end think\nBottom.")  # noqa: B005
+    r2 = s.strip("a <think>b</think> c")  # noqa: B005
+    assert r1.thinking == ["reason one"]
+    assert r1.clean == "Top.\nBottom."
+    assert r2.thinking == ["b"]
+    assert r2.clean == "a c"

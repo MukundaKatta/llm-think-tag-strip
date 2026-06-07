@@ -29,41 +29,30 @@ class StrippedResult:
     had_thinking: bool = False
 
 
-def _build_angle_pattern(tags: tuple[str, ...]) -> re.Pattern[str]:
-    """Build a non-greedy regex matching ``<tag>...</tag>`` for any tag.
+def _build_closed_pattern(tags: tuple[str, ...], markdown_style: bool) -> re.Pattern[str]:
+    """Build one combined regex matching any closed block form in a single pass.
 
-    Case-insensitive. ``DOTALL`` so blocks can span newlines.
+    Combining the angle, bracketed-pipe, and (optional) markdown forms into a
+    single alternation means a single :func:`re.sub` excises every block in true
+    left-to-right source order, regardless of which form each block uses. Each
+    alternative names its tag/body groups uniquely (``tag_a``/``body_a`` etc.)
+    because Python's :mod:`re` forbids duplicate group names in one pattern.
     """
     if not tags:
         raise ValueError("tags must be a non-empty tuple")
     alt = "|".join(re.escape(t) for t in tags)
-    # group(1) is the tag name (used to find the matching closer), group(2) is
-    # the inner content. The closer is matched against the same tag name via a
-    # named backreference so we don't accept </think> for <thinking>.
-    pattern = rf"<(?P<tag>{alt})\s*>(?P<body>.*?)</(?P=tag)\s*>"
-    return re.compile(pattern, re.IGNORECASE | re.DOTALL)
-
-
-def _build_pipe_pattern(tags: tuple[str, ...]) -> re.Pattern[str]:
-    """Build a regex for the ``<|thinking|>...</|thinking|>`` bracketed-pipe form."""
-    alt = "|".join(re.escape(t) for t in tags)
-    pattern = rf"<\|(?P<tag>{alt})\|>(?P<body>.*?)</\|(?P=tag)\|>"
-    return re.compile(pattern, re.IGNORECASE | re.DOTALL)
-
-
-def _build_markdown_pattern(tags: tuple[str, ...]) -> re.Pattern[str]:
-    """Build a regex for the markdown ``### Thinking ... ### End thinking`` form.
-
-    Matches headings of level 1-6. Allows an optional ``end`` marker; if absent,
-    runs to end of string (handled by a separate unclosed pattern below).
-    """
-    alt = "|".join(re.escape(t) for t in tags)
-    pattern = (
-        rf"#{{1,6}}\s*(?P<tag>{alt})\s*\n"
-        rf"(?P<body>.*?)"
-        rf"\n#{{1,6}}\s*end\s+(?P=tag)\s*(?:\n|$)"
-    )
-    return re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    angle = rf"<(?P<tag_a>{alt})\s*>(?P<body_a>.*?)</(?P=tag_a)\s*>"
+    pipe = rf"<\|(?P<tag_p>{alt})\|>(?P<body_p>.*?)</\|(?P=tag_p)\|>"
+    parts = [angle, pipe]
+    if markdown_style:
+        md = (
+            rf"#{{1,6}}[ \t]*(?P<tag_m>{alt})[ \t]*\n"
+            rf"(?P<body_m>.*?)"
+            rf"\n#{{1,6}}[ \t]*end[ \t]+(?P=tag_m)[ \t]*(?:\n|$)"
+        )
+        parts.append(md)
+    combined = "|".join(f"(?:{p})" for p in parts)
+    return re.compile(combined, re.IGNORECASE | re.DOTALL)
 
 
 def _build_unclosed_angle_pattern(tags: tuple[str, ...]) -> re.Pattern[str]:
@@ -119,9 +108,7 @@ class Stripper:
     __slots__ = (
         "_tags",
         "_markdown_style",
-        "_angle",
-        "_pipe",
-        "_markdown",
+        "_closed",
         "_unclosed_angle",
         "_unclosed_pipe",
         "_unclosed_markdown",
@@ -136,15 +123,16 @@ class Stripper:
             raise ValueError("tags must be a non-empty tuple")
         self._tags = tags
         self._markdown_style = markdown_style
-        self._angle = _build_angle_pattern(tags)
-        self._pipe = _build_pipe_pattern(tags)
+        # One combined pattern so a single pass excises every closed block in
+        # true source order, regardless of which form (angle/pipe/markdown) it
+        # uses. This keeps the documented "thinking blocks in source order"
+        # contract even when forms are interleaved.
+        self._closed = _build_closed_pattern(tags, markdown_style)
         self._unclosed_angle = _build_unclosed_angle_pattern(tags)
         self._unclosed_pipe = _build_unclosed_pipe_pattern(tags)
         if markdown_style:
-            self._markdown = _build_markdown_pattern(tags)
             self._unclosed_markdown = _build_unclosed_markdown_pattern(tags)
         else:
-            self._markdown = None
             self._unclosed_markdown = None
 
     def strip(self, text: str) -> StrippedResult:
@@ -155,17 +143,20 @@ class Stripper:
         thinking: list[str] = []
         out = text
 
-        # Closed blocks first, in this order: angle, pipe, markdown (if on).
-        # Using a single pass with re.sub + a list-append callback preserves
-        # source order while we excise.
+        # Closed blocks are excised in a single pass over a combined pattern so
+        # captures land in true left-to-right source order even when the angle,
+        # pipe, and markdown forms are interleaved. Only one body group matches
+        # per alternative, so we pull whichever of the body groups is set.
         def _capture(m: re.Match[str]) -> str:
-            thinking.append(m.group("body").strip())
+            body = m.group("body_a")
+            if body is None:
+                body = m.group("body_p")
+            if body is None:
+                body = m.groupdict().get("body_m")
+            thinking.append((body or "").strip())
             return ""
 
-        out = self._angle.sub(_capture, out)
-        out = self._pipe.sub(_capture, out)
-        if self._markdown is not None:
-            out = self._markdown.sub(_capture, out)
+        out = self._closed.sub(_capture, out)
 
         # Unclosed blocks: only match if an open tag exists with no closer left.
         # Try angle, pipe, markdown in that order. Only one unclosed block can

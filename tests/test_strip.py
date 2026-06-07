@@ -58,6 +58,22 @@ def test_multiple_blocks_same_tag():
     assert r.clean == "xy"
 
 
+def test_interleaved_forms_preserved_in_source_order():
+    # angle and bracketed-pipe blocks interleaved must come back in the order
+    # they appear in the source, not grouped by form.
+    raw = "X <think>A</think> Y <|think|>B</|think|> Z <think>C</think> W"
+    r = strip_thinking(raw)
+    assert r.thinking == ["A", "B", "C"]
+    assert r.clean == "X Y Z W"
+
+
+def test_interleaved_with_markdown_preserved_in_source_order():
+    raw = "<|think|>A</|think|>\n### thinking\nB\n### end thinking\n<think>C</think>"
+    r = strip_thinking(raw, markdown_style=True)
+    assert r.thinking == ["A", "B", "C"]
+    assert r.had_thinking is True
+
+
 def test_only_thinking_text_leaves_empty_clean():
     r = strip_thinking("<thinking>everything is reasoning</thinking>")
     assert r.clean == ""
